@@ -1,0 +1,11 @@
+# Environment variables (contains local configuration)
+.env
+
+# Go compiled binary output
+rate-limiter
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
