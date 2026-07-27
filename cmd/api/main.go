@@ -33,7 +33,10 @@ func main() {
 		log.Fatalf("Unable to connect to Redis: %v", err)
 	}
 
-	swLimiter := limiter.NewSlidingWindow(rdb, cfg.RateLimitRequests, cfg.RateLimitWindowSec)
+	swLimiter, err := limiter.NewSlidingWindow(ctx, rdb, cfg.RateLimitRequests, cfg.RateLimitWindowSec)
+	if err != nil {
+		log.Fatalf("Failed to initialize rate limiter: %v", err)
+	}
 
 	mux := http.NewServeMux()
 
