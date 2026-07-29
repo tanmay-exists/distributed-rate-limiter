@@ -33,20 +33,36 @@ func main() {
 		log.Fatalf("Unable to connect to Redis: %v", err)
 	}
 
-	swLimiter, err := limiter.NewSlidingWindow(ctx, rdb, cfg.RateLimitRequests, cfg.RateLimitWindowSec)
+	// Strategy 1: Sliding Window Counter (Strict, low-memory strategy for sensitive endpoints like auth)
+	swcLimiter, err := limiter.NewSlidingWindowCounter(ctx, rdb, 5, 60) // 5 req per 60s
 	if err != nil {
-		log.Fatalf("Failed to initialize rate limiter: %v", err)
+		log.Fatalf("Failed to initialize SlidingWindowCounter: %v", err)
+	}
+
+	// Strategy 2: Token Bucket (Burstable strategy for public API endpoints)
+	tbLimiter, err := limiter.NewTokenBucket(ctx, rdb, 15, 2) // Bucket capacity 15, 2 tokens/sec
+	if err != nil {
+		log.Fatalf("Failed to initialize TokenBucket: %v", err)
 	}
 
 	mux := http.NewServeMux()
 
-	protectedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Protected Handlers
+	authHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"message":"Request successful"}`))
+		_, _ = w.Write([]byte(`{"message":"Authentication successful"}`))
 	})
 
-	mux.Handle("/api/v1/resource", middleware.RateLimit(swLimiter)(protectedHandler))
+	resourceHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"message":"Resource retrieved successfully"}`))
+	})
+
+	// Register routes with different rate limiter strategies
+	mux.Handle("/api/v1/auth/login", middleware.RateLimit(swcLimiter)(authHandler))
+	mux.Handle("/api/v1/resource", middleware.RateLimit(tbLimiter)(resourceHandler))
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
