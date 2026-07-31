@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"rate-limiter/internal/config"
@@ -24,26 +27,31 @@ func main() {
 		Addr:     cfg.RedisAddr,
 		Password: cfg.RedisPassword,
 		DB:       0,
+		DialTimeout:  2 * time.Second, // Timeout for establishing initial TCP connection
+    ReadTimeout:  1 * time.Second, // Timeout for reading responses from Redis
+    WriteTimeout: 1 * time.Second, // Timeout for sending commands to Redis
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("Unable to connect to Redis: %v", err)
+    log.Printf("Warning: Initial Redis connection failed (%v). Circuit breakers will start ready.", err)
 	}
 
 	// Strategy 1: Sliding Window Counter (Strict, low-memory strategy for sensitive endpoints like auth)
-	swcLimiter, err := limiter.NewSlidingWindowCounter(ctx, rdb, 5, 60) // 5 req per 60s
+	rawSWCLimiter, err := limiter.NewSlidingWindowCounter(ctx, rdb, 5, 60)
 	if err != nil {
 		log.Fatalf("Failed to initialize SlidingWindowCounter: %v", err)
 	}
 
-	// Strategy 2: Token Bucket (Burstable strategy for public API endpoints)
-	tbLimiter, err := limiter.NewTokenBucket(ctx, rdb, 15, 2) // Bucket capacity 15, 2 tokens/sec
+	rawTBLimiter, err := limiter.NewTokenBucket(ctx, rdb, 15, 2)
 	if err != nil {
 		log.Fatalf("Failed to initialize TokenBucket: %v", err)
 	}
+
+	swcLimiter := limiter.NewCircuitBreakerLimiter(rawSWCLimiter, "sliding_window_auth")
+	tbLimiter := limiter.NewCircuitBreakerLimiter(rawTBLimiter, "token_bucket_api")
 
 	mux := http.NewServeMux()
 
@@ -72,8 +80,30 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	log.Printf("Server running on port %s", cfg.Port)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Server error: %v", err)
+	go func() {
+		log.Printf("Server running on port %s", cfg.Port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	// Graceful Shutdown Handler
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down server...")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("Server forced shutdown: %v", err)
 	}
+
+	if err := rdb.Close(); err != nil {
+		log.Printf("Error closing Redis client: %v", err)
+	}
+
+	log.Println("Server stopped cleanly")
 }
