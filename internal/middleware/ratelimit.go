@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"rate-limiter/internal/limiter"
+	"rate-limiter/internal/metrics"
 )
 
 func RateLimit(l limiter.Limiter) func(http.Handler) http.Handler {
@@ -15,17 +17,28 @@ func RateLimit(l limiter.Limiter) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			identifier := extractIdentifier(r)
 
+			// 1. Measure Redis operation latency
+			start := time.Now()
 			result, err := l.Allow(r.Context(), identifier)
+			duration := time.Since(start).Seconds()
+
+			// Record latency metric with strategy name label
+			metrics.RedisLatency.WithLabelValues(l.Name()).Observe(duration)
+
 			if err != nil {
 				// Fail-Open Pattern: Log fault and let traffic pass during outages
 				log.Printf("Rate limiter error for client %s: %v", identifier, err)
+				metrics.RequestsTotal.WithLabelValues(l.Name(), "allowed").Inc()
 				next.ServeHTTP(w, r)
 				return
 			}
 
 			w.Header().Set("X-RateLimit-Remaining", strconv.FormatInt(result.Remaining, 10))
 
+			// 2. Handle Rate Limited Traffic
 			if !result.Allowed {
+				metrics.RequestsTotal.WithLabelValues(l.Name(), "blocked").Inc()
+				
 				w.Header().Set("Retry-After", strconv.FormatInt(result.ResetSec, 10))
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusTooManyRequests)
@@ -33,6 +46,8 @@ func RateLimit(l limiter.Limiter) func(http.Handler) http.Handler {
 				return
 			}
 
+			// 3. Handle Allowed Traffic
+			metrics.RequestsTotal.WithLabelValues(l.Name(), "allowed").Inc()
 			next.ServeHTTP(w, r)
 		})
 	}

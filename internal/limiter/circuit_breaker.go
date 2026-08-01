@@ -6,12 +6,15 @@ import (
 	"log"
 	"time"
 
+	"rate-limiter/internal/metrics"
+
 	"github.com/sony/gobreaker"
 )
 
 type CircuitBreakerLimiter struct {
 	wrapped Limiter
 	cb      *gobreaker.CircuitBreaker
+	name    string // <-- Store the name here
 }
 
 // NewCircuitBreakerLimiter wraps any Limiter with a resilience circuit breaker layer.
@@ -28,13 +31,34 @@ func NewCircuitBreakerLimiter(wrapped Limiter, name string) *CircuitBreakerLimit
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			log.Printf("[Circuit Breaker: %s] State changed from %s to %s", name, from, to)
+
+			// Map gobreaker.State to metric gauge values (0=Closed, 1=Half-Open, 2=Open)
+			var stateVal float64
+			switch to {
+			case gobreaker.StateClosed:
+				stateVal = 0
+			case gobreaker.StateHalfOpen:
+				stateVal = 1
+			case gobreaker.StateOpen:
+				stateVal = 2
+			}
+			metrics.CircuitBreakerState.WithLabelValues(name).Set(stateVal)
 		},
 	}
+
+	// Initialize Prometheus gauge to 0 (Closed) on startup
+	metrics.CircuitBreakerState.WithLabelValues(name).Set(0)
 
 	return &CircuitBreakerLimiter{
 		wrapped: wrapped,
 		cb:      gobreaker.NewCircuitBreaker(st),
+		name:    name, // <-- Assign the name here
 	}
+}
+
+// Name returns the identifier for this circuit breaker strategy.
+func (c *CircuitBreakerLimiter) Name() string {
+	return c.name
 }
 
 func (c *CircuitBreakerLimiter) Allow(ctx context.Context, identifier string) (*Result, error) {

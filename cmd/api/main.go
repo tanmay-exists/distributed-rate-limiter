@@ -14,7 +14,9 @@ import (
 	"rate-limiter/internal/config"
 	"rate-limiter/internal/limiter"
 	"rate-limiter/internal/middleware"
+	_ "rate-limiter/internal/metrics"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -84,6 +86,9 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"OK"}`))
 	})
+
+	// Expose Prometheus Metrics Endpoint
+	mux.Handle("/metrics", promhttp.Handler())
 
 	mux.Handle("/api/v1/auth/login", middleware.RateLimit(swcLimiter)(authHandler))
 	mux.Handle("/api/v1/resource", middleware.RateLimit(tbLimiter)(resourceHandler))

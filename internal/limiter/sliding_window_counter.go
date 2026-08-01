@@ -91,3 +91,7 @@ func (sw *SlidingWindowCounter) Allow(ctx context.Context, identifier string) (*
 		ResetSec:  sw.windowSec,
 	}, nil
 }
+
+func (sw *SlidingWindowCounter) Name() string {
+	return "sliding_window"
+}

@@ -11,4 +11,5 @@ type Result struct {
 // Limiter defines the contract for any rate-limiting algorithm strategy.
 type Limiter interface {
 	Allow(ctx context.Context, identifier string) (*Result, error)
+	Name() string
 }

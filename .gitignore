@@ -1,11 +1,23 @@
-# Environment variables (contains local configuration)
+# Environment variables
 .env
+.env.*
+!.env.example
 
 # Go compiled binary output
-rate-limiter
+/api
+/rate-limiter
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 
+# Test & coverage artifacts
+*.test
+*.out
+*.prof
+
+# OS & Editor files
+.DS_Store
+*.swp
+*~

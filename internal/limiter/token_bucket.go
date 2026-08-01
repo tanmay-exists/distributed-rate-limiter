@@ -90,3 +90,7 @@ func (tb *TokenBucket) Allow(ctx context.Context, identifier string) (*Result, e
 		ResetSec:  1,
 	}, nil
 }
+
+func (tb *TokenBucket) Name() string {
+	return "token_bucket"
+}
