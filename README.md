@@ -112,8 +112,8 @@ Tokens are added to a bucket at a constant refill rate per second up to a define
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/your-username/rate-limiter.git
-   cd rate-limiter
+   git clone https://github.com/tanmay-exists/distributed-rate-limiter.git
+   cd distributed-rate-limiter
    ```
 
 2. Copy the environment template:
