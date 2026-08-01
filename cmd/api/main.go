@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -18,44 +19,54 @@ import (
 )
 
 func main() {
+	// 1. Load configuration
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	// 2. Initialize Redis Client with Connection Pool timeouts
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPassword,
-		DB:       0,
-		DialTimeout:  2 * time.Second, // Timeout for establishing initial TCP connection
-    ReadTimeout:  1 * time.Second, // Timeout for reading responses from Redis
-    WriteTimeout: 1 * time.Second, // Timeout for sending commands to Redis
+		Addr:         cfg.RedisAddr,
+		Password:     cfg.RedisPassword,
+		DB:           0,
+		DialTimeout:  2 * time.Second,
+		ReadTimeout:  1 * time.Second,
+		WriteTimeout: 1 * time.Second,
+		PoolSize:     10, // Max active connections
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Initial connectivity ping
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer pingCancel()
 
-	if err := rdb.Ping(ctx).Err(); err != nil {
-    log.Printf("Warning: Initial Redis connection failed (%v). Circuit breakers will start ready.", err)
+	if err := rdb.Ping(pingCtx).Err(); err != nil {
+		log.Printf("[WARNING] Redis connection failed on startup (%v). Circuit breakers will start ready.", err)
+	} else {
+		log.Println("[INFO] Successfully connected to Redis.")
 	}
 
-	// Strategy 1: Sliding Window Counter (Strict, low-memory strategy for sensitive endpoints like auth)
-	rawSWCLimiter, err := limiter.NewSlidingWindowCounter(ctx, rdb, 5, 60)
+	// 3. Initialize Limiter Strategies
+	initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer initCancel()
+
+	rawSWCLimiter, err := limiter.NewSlidingWindowCounter(initCtx, rdb, 5, 60) // 5 req / 60s
 	if err != nil {
 		log.Fatalf("Failed to initialize SlidingWindowCounter: %v", err)
 	}
 
-	rawTBLimiter, err := limiter.NewTokenBucket(ctx, rdb, 15, 2)
+	rawTBLimiter, err := limiter.NewTokenBucket(initCtx, rdb, 15, 2) // Cap 15, 2 tokens/sec
 	if err != nil {
 		log.Fatalf("Failed to initialize TokenBucket: %v", err)
 	}
 
+	// 4. Wrap Strategies in Circuit Breakers
 	swcLimiter := limiter.NewCircuitBreakerLimiter(rawSWCLimiter, "sliding_window_auth")
 	tbLimiter := limiter.NewCircuitBreakerLimiter(rawTBLimiter, "token_bucket_api")
 
+	// 5. Setup Routes
 	mux := http.NewServeMux()
 
-	// Protected Handlers
 	authHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -68,10 +79,16 @@ func main() {
 		_, _ = w.Write([]byte(`{"message":"Resource retrieved successfully"}`))
 	})
 
-	// Register routes with different rate limiter strategies
+	// Health check endpoint for Load Balancers (AWS ELB / K8s probes)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"OK"}`))
+	})
+
 	mux.Handle("/api/v1/auth/login", middleware.RateLimit(swcLimiter)(authHandler))
 	mux.Handle("/api/v1/resource", middleware.RateLimit(tbLimiter)(resourceHandler))
 
+	// 6. Configure HTTP Server
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
 		Handler:      mux,
@@ -80,30 +97,45 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
+	// 7. Start Server in a separate Goroutine
+	serverErrors := make(chan error, 1)
 	go func() {
-		log.Printf("Server running on port %s", cfg.Port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server error: %v", err)
-		}
+		log.Printf("[INFO] Server starting on port %s", cfg.Port)
+		serverErrors <- server.ListenAndServe()
 	}()
 
-	// Graceful Shutdown Handler
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-	<-quit
+	// 8. Trap OS Shutdown Signals (Ctrl+C / Docker Stop)
+	shutdownSignal := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignal, os.Interrupt, syscall.SIGTERM)
 
-	log.Println("Shutting down server...")
+	// Block until a signal or server error occurs
+	select {
+	case err := <-serverErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("[FATAL] Unhandled HTTP server error: %v", err)
+		}
+	case sig := <-shutdownSignal:
+		log.Printf("[INFO] Shutdown signal received (%v). Initiating graceful shutdown...", sig)
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
+		// Create a 15-second deadline for active requests to complete
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer shutdownCancel()
 
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("Server forced shutdown: %v", err)
+		// Stop accepting new connections and drain active ones
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[ERROR] Could not stop server gracefully: %v", err)
+			if err := server.Close(); err != nil {
+				log.Printf("[ERROR] Force close error: %v", err)
+			}
+		}
+
+		// Close Redis connection pool
+		if err := rdb.Close(); err != nil {
+			log.Printf("[ERROR] Error closing Redis connections: %v", err)
+		} else {
+			log.Println("[INFO] Redis connection pool closed cleanly.")
+		}
+
+		log.Println("[INFO] Server exited gracefully.")
 	}
-
-	if err := rdb.Close(); err != nil {
-		log.Printf("Error closing Redis client: %v", err)
-	}
-
-	log.Println("Server stopped cleanly")
 }
