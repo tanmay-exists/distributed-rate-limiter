@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -11,10 +12,11 @@ import (
 	"syscall"
 	"time"
 
+	_ "rate-limiter/internal/metrics"
+
 	"rate-limiter/internal/config"
 	"rate-limiter/internal/limiter"
 	"rate-limiter/internal/middleware"
-	_ "rate-limiter/internal/metrics"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
@@ -28,7 +30,7 @@ func main() {
 	}
 
 	// 2. Initialize Redis Client with Connection Pool timeouts
-	rdb := redis.NewClient(&redis.Options{
+	redisOpts := &redis.Options{
 		Addr:         cfg.RedisAddr,
 		Password:     cfg.RedisPassword,
 		DB:           0,
@@ -36,7 +38,16 @@ func main() {
 		ReadTimeout:  1 * time.Second,
 		WriteTimeout: 1 * time.Second,
 		PoolSize:     10, // Max active connections
-	})
+	}
+
+	// Enable TLS for cloud Redis providers (e.g., Upstash) if requested via ENV
+	if os.Getenv("REDIS_USE_TLS") == "true" {
+		redisOpts.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+
+	rdb := redis.NewClient(redisOpts)
 
 	// Initial connectivity ping
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -79,6 +90,17 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"message":"Resource retrieved successfully"}`))
+	})
+
+	// Root path handler to avoid 404 when visiting base domain
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"online","service":"Distributed Rate Limiter API"}`))
 	})
 
 	// Health check endpoint for Load Balancers (AWS ELB / K8s probes)
