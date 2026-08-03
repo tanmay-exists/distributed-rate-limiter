@@ -1,0 +1,5 @@
+FROM prom/prometheus:latest
+COPY prometheus-cloud.yml /etc/prometheus/prometheus-template.yml
+USER root
+RUN apk add --no-cache gettext
+CMD ["sh", "-c", "envsubst < /etc/prometheus/prometheus-template.yml > /etc/prometheus/prometheus.yml && prometheus --config.file=/etc/prometheus/prometheus.yml --enable-feature=agent"]
