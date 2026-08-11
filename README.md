@@ -1,7 +1,5 @@
 # Distributed Rate Limiter
 
-[![CI](https://github.com/your-username/rate-limiter/actions/workflows/ci.yml/badge.svg)](https://github.com/your-username/rate-limiter/actions/workflows/ci.yml)
-
 A distributed rate limiting service built in Go. Multiple stateless API replicas sit behind an nginx load balancer and share rate-limit state through Redis 7+ Lua functions (`FCALL`), so the limit is enforced globally, not per-process. Redis itself runs as a Sentinel-managed master/replica pair for automatic failover. Each replica wraps its Redis calls in an in-memory circuit breaker for fail-open resilience during datastore outages.
 
 ---
