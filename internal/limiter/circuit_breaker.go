@@ -11,28 +11,45 @@ import (
 	"github.com/sony/gobreaker"
 )
 
+// CircuitBreakerLimiter wraps any Limiter with a resilience circuit breaker
+// layer.
+//
+// Known trade-off: breaker state lives in-process and is local to a single
+// replica. Each API instance trips and recovers independently based on its
+// own observed Redis failures - there is no shared "the datastore is down"
+// signal across replicas. This is a deliberate choice, not an oversight:
+// coordinating breaker state across instances (e.g. via a shared Redis key
+// or pub/sub channel) would mean relying on the very datastore the breaker
+// exists to protect against, adding latency and a new failure mode to solve
+// a problem that mostly self-corrects. In practice, a real Redis outage
+// affects every replica's connections at roughly the same time, so they
+// converge to OPEN within a request cycle or two of each other. The
+// "instance" label on rate_limiter_circuit_breaker_state makes this
+// per-replica behavior directly observable rather than hidden.
 type CircuitBreakerLimiter struct {
-	wrapped Limiter
-	cb      *gobreaker.CircuitBreaker
-	name    string // <-- Store the name here
+	wrapped    Limiter
+	cb         *gobreaker.CircuitBreaker
+	name       string
+	instanceID string
 }
 
-// NewCircuitBreakerLimiter wraps any Limiter with a resilience circuit breaker layer.
-func NewCircuitBreakerLimiter(wrapped Limiter, name string) *CircuitBreakerLimiter {
+// NewCircuitBreakerLimiter wraps a Limiter with a circuit breaker. instanceID
+// identifies the replica this breaker belongs to (see cfg.InstanceID) and is
+// attached to every log line and metric this breaker emits.
+func NewCircuitBreakerLimiter(wrapped Limiter, name string, instanceID string) *CircuitBreakerLimiter {
 	st := gobreaker.Settings{
 		Name:        name,
 		MaxRequests: 3,                // Requests allowed in Half-Open state to test recovery
 		Interval:    10 * time.Second, // Clear counter interval in Closed state
 		Timeout:     5 * time.Second,  // Time spent in Open state before transitioning to Half-Open
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
-			// Trip to OPEN after 5 consecutive failures
+			// Trip to OPEN after 5+ requests with a >=60% failure ratio
 			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
 			return counts.Requests >= 5 && failureRatio >= 0.6
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
-			log.Printf("[Circuit Breaker: %s] State changed from %s to %s", name, from, to)
+			log.Printf("[Circuit Breaker: %s @ %s] State changed from %s to %s", name, instanceID, from, to)
 
-			// Map gobreaker.State to metric gauge values (0=Closed, 1=Half-Open, 2=Open)
 			var stateVal float64
 			switch to {
 			case gobreaker.StateClosed:
@@ -42,17 +59,18 @@ func NewCircuitBreakerLimiter(wrapped Limiter, name string) *CircuitBreakerLimit
 			case gobreaker.StateOpen:
 				stateVal = 2
 			}
-			metrics.CircuitBreakerState.WithLabelValues(name).Set(stateVal)
+			metrics.CircuitBreakerState.WithLabelValues(name, instanceID).Set(stateVal)
 		},
 	}
 
 	// Initialize Prometheus gauge to 0 (Closed) on startup
-	metrics.CircuitBreakerState.WithLabelValues(name).Set(0)
+	metrics.CircuitBreakerState.WithLabelValues(name, instanceID).Set(0)
 
 	return &CircuitBreakerLimiter{
-		wrapped: wrapped,
-		cb:      gobreaker.NewCircuitBreaker(st),
-		name:    name, // <-- Assign the name here
+		wrapped:    wrapped,
+		cb:         gobreaker.NewCircuitBreaker(st),
+		name:       name,
+		instanceID: instanceID,
 	}
 }
 
@@ -70,9 +88,9 @@ func (c *CircuitBreakerLimiter) Allow(ctx context.Context, identifier string) (*
 	if err != nil {
 		// Detect if the error is from the Circuit Breaker being OPEN or timing out
 		if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
-			log.Printf("[Circuit Breaker OPEN] Bypassing Redis for client %s (Failing Open instantly)", identifier)
+			log.Printf("[Circuit Breaker OPEN @ %s] Bypassing Redis for client %s (Failing Open instantly)", c.instanceID, identifier)
 		} else {
-			log.Printf("[Rate Limiter Error] %v for client %s (Failing Open)", err, identifier)
+			log.Printf("[Rate Limiter Error @ %s] %v for client %s (Failing Open)", c.instanceID, err, identifier)
 		}
 
 		// FAIL-OPEN FALLBACK: Allow traffic through when Redis is unreachable or circuit is OPEN

@@ -51,9 +51,8 @@ type TokenBucket struct {
 }
 
 func NewTokenBucket(ctx context.Context, client *redis.Client, capacity, refillRate int64) (*TokenBucket, error) {
-	err := client.FunctionLoadReplace(ctx, tokenBucketLib).Err()
-	if err != nil && err.Error() != "ERR Library 'token_bucket_lib' already exists" {
-		fmt.Printf("Notice on token_bucket_lib load: %v\n", err)
+	if err := loadFunctionWithRetry(ctx, client, tokenBucketLib, "token_bucket_lib"); err != nil {
+		return nil, err
 	}
 
 	return &TokenBucket{
@@ -66,7 +65,10 @@ func NewTokenBucket(ctx context.Context, client *redis.Client, capacity, refillR
 func (tb *TokenBucket) Allow(ctx context.Context, identifier string) (*Result, error) {
 	key := fmt.Sprintf("tb:%s", identifier)
 	nowSec := time.Now().Unix()
-	ttlSec := (tb.capacity / tb.refillRate) + 60
+	ttlSec := int64(60)
+	if tb.refillRate > 0 {
+		ttlSec = (tb.capacity / tb.refillRate) + 60
+	}
 
 	keys := []string{key}
 	args := []interface{}{tb.capacity, tb.refillRate, nowSec, ttlSec}

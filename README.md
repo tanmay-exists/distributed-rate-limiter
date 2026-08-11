@@ -1,82 +1,65 @@
 # Distributed Rate Limiter
 
-A high-performance, distributed rate limiting service built in Go. This system implements multiple rate-limiting algorithms backed by Redis 7+ Lua functions, featuring an in-memory Circuit Breaker to ensure high availability and fail-open handling during datastore outages. Real-time system metrics are exported directly to Prometheus and visualised through Grafana dashboards.
+[![CI](https://github.com/your-username/rate-limiter/actions/workflows/ci.yml/badge.svg)](https://github.com/your-username/rate-limiter/actions/workflows/ci.yml)
+
+A distributed rate limiting service built in Go. Multiple stateless API replicas sit behind an nginx load balancer and share rate-limit state through Redis 7+ Lua functions (`FCALL`), so the limit is enforced globally, not per-process. Redis itself runs as a Sentinel-managed master/replica pair for automatic failover. Each replica wraps its Redis calls in an in-memory circuit breaker for fail-open resilience during datastore outages.
 
 ---
 
 ## System Architecture
 
 ```text
-                               +---------------------------------------+
-                               |              HTTP Client               |
-                               +---------------------------------------+
-                                                   |
-                                                   v
-+---------------------------------------------------------------------------------------------------+
-| Go API Service (Port 8080)                                                                         |
-|                                                                                                     |
-|   +-------------------------------------------------------------------------------------------+   |
-|   | Rate Limit Middleware                                                                      |   |
-|   |                                                                                             |   |
-|   |   1. Extracts Client Identifier (IP / API Key)                                              |   |
-|   |   2. Invokes Circuit Breaker Wrapper                                                        |   |
-|   |      +---------------------------------------------------------------------------------+   |   |
-|   |      | Circuit Breaker State Check                                                      |   |   |
-|   |      |                                                                                   |   |   |
-|   |      |  [STATE: OPEN] ----(Bypass Datastore / Fail-Open)-------------> Allow Request      |   |   |
-|   |      |                                                                                   |   |   |
-|   |      |  [STATE: CLOSED / HALF-OPEN]                                                      |   |   |
-|   |      |        |                                                                          |   |   |
-|   |      |        v                                                                          |   |   |
-|   |      |  Execute Strategy FCALL (Sliding Window / Token Bucket)                            |   |   |
-|   |      +---------------------------------------------------------------------------------+   |   |
-|   +-------------------------------------------------------------------------------------------+   |
-|                               |                                      |                             |
-|                               v                                      v                             |
-|             +----------------------------------+   +----------------------------------+            |
-|             | Sliding Window Counter Strategy   |   |      Token Bucket Strategy       |            |
-|             +----------------------------------+   +----------------------------------+            |
-|                               |                                      |                             |
-+-------------------------------|--------------------------------------|-----------------------------+
-                                |                                      |
-                         (Redis FCALL)                          (Redis FCALL)
-                                |                                      |
-                                v                                      v
-                               +----------------------------------------+
-                               |          Redis 7+ Container            |
-                               |  (Executes registered Lua functions)   |
-                               +----------------------------------------+
-
-                                                ===
-
-+---------------------------------------------------------------------------------------------------+
-| Observability Stack                                                                                |
-|                                                                                                     |
-|   +-------------------+        Scrapes /metrics        +-------------------+                       |
-|   |   Go Application  | <----------------------------- | Prometheus Server |                       |
-|   |  Prometheus SDK   |                                |    (Port 9090)    |                       |
-|   +-------------------+                                +-------------------+                       |
-|                                                                  |                                  |
-|                                                                  | PromQL Queries                   |
-|                                                                  v                                  |
-|                                                        +-------------------+                        |
-|                                                        | Grafana Dashboard |                        |
-|                                                        |    (Port 3000)    |                        |
-|                                                        +-------------------+                        |
-+---------------------------------------------------------------------------------------------------+
+                                    +-------------------+
+                                    |    HTTP Client     |
+                                    +-------------------+
+                                              |
+                                              v
+                                    +-------------------+
+                                    |   nginx (LB, :8080) |
+                                    +-------------------+
+                                     /        |         \
+                                    v         v          v
+                          +--------+  +--------+  +--------+
+                          | api-1  |  | api-2  |  | api-3  |
+                          | :8080  |  | :8080  |  | :8080  |
+                          +--------+  +--------+  +--------+
+                                     \        |        /
+                                      \       |       /
+                                   Rate Limit Middleware
+                                   1. Extract client ID (IP / API key)
+                                   2. Per-instance Circuit Breaker check
+                                   3. FCALL sliding-window / token-bucket
+                                      Lua function (atomic in Redis)
+                                              |
+                                              v
+                          +------------------------------------+
+                          |  Redis Sentinel (mymaster, quorum 2) |
+                          |  sentinel-1  sentinel-2  sentinel-3   |
+                          +------------------------------------+
+                                   |                    |
+                                   v                    v
+                          +----------------+   +-----------------+
+                          |  redis-master   |-->|  redis-replica  |
+                          +----------------+   +-----------------+
+                          (all state lives here - this is what makes
+                           api-1/2/3 share one global rate-limit view)
 ```
+
+Each API replica is a separate OS process with its own in-memory circuit breaker - it does **not** know about the other replicas directly. The only shared state is in Redis. That's the whole trick: correctness under concurrency comes from Redis executing each `FCALL` atomically and serially, not from any coordination between application instances.
 
 ---
 
 ## Core Features
 
-- **Multiple Limiting Strategies:**
-  - **Sliding Window Counter:** Provides smooth rate limiting using a weighted execution algorithm over current and previous window buckets.
-  - **Token Bucket:** Allows controlled bursts of traffic up to a maximum bucket capacity while continuously replenishing tokens at a fixed rate per second.
-- **Atomic Redis 7+ Execution:** Uses Redis Function Libraries (`FCALL`) written in Lua to handle limit evaluation and bucket updates atomically, eliminating race conditions across multiple application instances.
-- **Circuit Breaker Integration:** Wraps datastore calls in a state machine (`CLOSED`, `OPEN`, `HALF-OPEN`). If Redis fails or times out consistently, the breaker trips to `OPEN` and degrades gracefully by failing open, preventing datastore outages from causing application downtime.
-- **Standard HTTP Headers:** Returns full rate limiting visibility to clients using standard HTTP headers (`X-Ratelimit-Remaining`, `Retry-After`).
-- **Prometheus Observability:** Tracks allowed requests, blocked requests (HTTP 429), strategy execution metrics, and circuit breaker state transitions.
+- **Multiple Limiting Strategies**
+  - **Sliding Window Counter** — smooths traffic across fixed window boundaries using a weighted estimate of the previous and current window counts.
+  - **Token Bucket** — allows controlled bursts up to a capacity while refilling at a fixed rate per second.
+- **Atomic Redis 7+ Execution** — Redis Function Libraries (`FCALL`) written in Lua evaluate and update state atomically. Redis's single-threaded execution model means this holds even when many API replicas call it concurrently for the same client — see [Concurrency Correctness](#concurrency-correctness).
+- **Horizontally Scaled API** — 3 stateless replicas behind nginx by default. Add more by copying an `api-N` block in `docker-compose.yml`.
+- **Redis High Availability** — master/replica Redis behind 3 Sentinels. The API connects via Sentinel and automatically reconnects to whichever node is promoted master after a failover.
+- **Per-Instance Circuit Breaker** — each replica has its own `CLOSED → OPEN → HALF-OPEN` breaker around Redis calls, failing open (allowing traffic) when Redis is unreachable. See [Known Trade-offs](#known-trade-offs) for why this is per-instance rather than shared.
+- **Standard HTTP Headers** — `X-Ratelimit-Remaining`, `Retry-After`, and `X-Served-By` (which replica handled the request — useful for proving distribution, see the load test tool below).
+- **Prometheus Instrumentation** — request counts, blocked/allowed status, and per-instance circuit breaker state, exported at `/metrics`. No bundled Prometheus/Grafana stack — see [Observability](#observability) for why.
 
 ---
 
@@ -84,19 +67,19 @@ A high-performance, distributed rate limiting service built in Go. This system i
 
 ### 1. Sliding Window Counter
 
-Rather than dropping traffic abruptly at fixed time boundaries, the sliding window algorithm estimates current request volume using a weighted sum of the previous window's count and the current window's count:
+Estimates current request volume as a weighted sum of the previous window's count and the current window's count, avoiding the abrupt reset traffic sees at fixed boundaries:
 
 $$\text{Estimated Count} = \text{Count}_{\text{prev}} \times \left(1 - \frac{t_{\text{current}}}{\text{Window Size}}\right) + \text{Count}_{\text{curr}}$$
 
-- **Use Case:** Fixed rate thresholds where boundary spikes must be smooth (e.g., authentication routes).
-- **Endpoint Route:** `/api/v1/auth/login` (5 requests / 60 seconds).
+- **Use case:** fixed thresholds where boundary spikes must be smooth (e.g. auth routes).
+- **Route:** `/api/v1/auth/login` — 5 requests / 60 seconds (configurable via `RATE_LIMIT_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS`).
 
 ### 2. Token Bucket
 
-Tokens are added to a bucket at a constant refill rate per second up to a defined maximum capacity. Each incoming request consumes one token. If no tokens remain, the request is rejected with an HTTP 429 status code.
+Tokens refill at a constant rate up to a capacity; each request consumes one. Empty bucket → `429`.
 
-- **Use Case:** API routes that need to handle bursty traffic patterns without overwhelming downstream infrastructure.
-- **Endpoint Route:** `/api/v1/resource` (Capacity: 15 tokens, Refill: 2 tokens/sec).
+- **Use case:** bursty traffic that shouldn't overwhelm downstream infrastructure.
+- **Route:** `/api/v1/resource` — capacity 15, refill 2 tokens/sec.
 
 ---
 
@@ -104,109 +87,184 @@ Tokens are added to a bucket at a constant refill rate per second up to a define
 
 ### Prerequisites
 
-- Go 1.22 or higher
+- Go 1.22+
 - Docker and Docker Compose
 
 ### Local Installation & Setup
 
-1. Clone the repository:
+```bash
+git clone https://github.com/your-username/rate-limiter.git
+cd rate-limiter
+cp .env.example .env
+```
 
-   ```bash
-   git clone https://github.com/tanmay-exists/distributed-rate-limiter.git
-   cd distributed-rate-limiter
-   ```
+> **Note:** this repo ships `go.mod` but not `go.sum` — run `go mod tidy` once after cloning to resolve and lock dependency checksums.
 
-2. Copy the environment template:
+Bring up the full stack — 3 API replicas, nginx, and Redis Sentinel HA:
 
-   ```bash
-   cp .env.example .env
-   ```
+```bash
+docker compose up --build
+```
 
-3. Build and launch the entire infrastructure stack (API, Redis, Prometheus, Grafana):
+| Service | Address |
+|---|---|
+| API (via nginx load balancer) | http://localhost:8080 |
+| Individual replicas (debugging only, not exposed by default) | `docker compose exec api-1 wget -qO- localhost:8080/health` |
 
-   ```bash
-   docker compose up --build
-   ```
-
-4. The services will start on the following ports:
-
-   | Service | URL |
-   |---|---|
-   | Go API Service | http://localhost:8080 |
-   | Prometheus UI | http://localhost:9090 |
-   | Grafana Dashboard | http://localhost:3000 |
+All client traffic should go through nginx on `:8080`. Hitting an individual `api-N` container directly bypasses the load balancer, which defeats the point of the multi-instance test below.
 
 ---
 
-## Observability & Monitoring
+## Concurrency Correctness
 
-### Prometheus Metrics
+The core claim of this project is: **N replicas, one globally-consistent limit.** Two ways to verify that:
 
-The service exports standard Prometheus metrics at `http://localhost:8080/metrics`:
+### 1. Automated concurrency tests (`go test`)
 
-- `rate_limiter_requests_total`: Counter tracking total requests tagged by status (`allowed` or `blocked`) and strategy.
-- `rate_limiter_circuit_breaker_state`: Gauge tracking current state (`0` = CLOSED, `1` = HALF-OPEN, `2` = OPEN).
+`internal/limiter/token_bucket_test.go` and `sliding_window_counter_test.go` fire 50–100 goroutines at the *same identifier* simultaneously and assert the allowed count is exact:
 
-### Grafana Dashboard Setup
+```bash
+docker run -d --rm -p 6379:6379 redis:7-alpine
+TEST_REDIS_ADDR=localhost:6379 go test ./internal/limiter/... -run Concurrent -v -race
+```
 
-1. Access Grafana at `http://localhost:3000` (Default credentials: `admin` / `admin`).
-2. Add a new Prometheus Data Source with the URL:
+Expected: exactly `capacity` (token bucket) or `limit` (sliding window) requests allowed, no matter how many goroutines raced for them — proving `FCALL` execution is atomic under concurrency, not just under sequential calls.
 
-   ```text
-   http://prometheus:9090
-   ```
+### 2. Load test against the live multi-instance stack
 
-3. Create a new dashboard and add a Time Series panel with the following PromQL query to visualize request throughput by status:
+```bash
+docker compose up --build -d
+go run ./cmd/loadtest -url http://localhost:8080/api/v1/resource -concurrency 50 -key demo-client
+```
 
-   ```promql
-   sum(rate(rate_limiter_requests_total[1m])) by (status, strategy)
-   ```
+Example output:
+
+```text
+Fired 50 concurrent requests at http://localhost:8080/api/v1/resource in 210ms
+
+  allowed (200):        15
+  blocked (429):        35
+  failed (network/etc): 0
+
+  requests served per backend instance:
+    api-1      17
+    api-2      16
+    api-3      17
+
+  Multiple instances served this run and the allowed count above still matches the
+  configured limit - confirming the limit is enforced globally via Redis, not per-process.
+```
+
+Exactly 15 requests allowed (the token bucket's capacity) even though the requests were spread across all three API replicas by nginx — this is the distributed guarantee in action, not a claim on paper.
 
 ---
 
-## Verification & Testing
+## Known Trade-offs
 
-### 1. Test Sliding Window Rate Limit
+Being upfront about what this design does and doesn't solve:
 
-Run a loop to send 8 requests to the auth route (limit is 5):
+- **Circuit breaker state is per-instance, in-memory.** Each replica trips and recovers independently based on its own observed Redis failures — there's no shared "Redis is down" signal across replicas. This is deliberate: coordinating breaker state across instances would mean depending on the same datastore the breaker exists to protect against, trading a small window of inconsistency for not introducing a new failure mode. In a real outage, all replicas see failures at roughly the same time and converge to `OPEN` within a request cycle or two of each other. The `instance` label on `rate_limiter_circuit_breaker_state` makes this observable — you can watch `api-1` and `api-2` trip at slightly different moments in `/metrics`.
+- **Fail-open under a Redis/Sentinel-quorum outage means rate limiting is temporarily disabled**, not that requests fail. This is a conscious availability-over-strictness choice, appropriate for this kind of traffic-shaping middleware but worth calling out explicitly — it would be the wrong choice for, say, a payment authorization check.
+- **Sentinel failover has a detection window** (`down-after-milliseconds`, 5s here) — during that window the breaker on each replica will see failures and fail open, then recover once the new master is promoted and go-redis reconnects.
+
+---
+
+## Redis High Availability
+
+Redis runs as one master, one replica, and 3 Sentinels (quorum 2) instead of a single instance. The API connects through Sentinel rather than a hardcoded address, so it always finds the current master.
+
+**Test a failover:**
 
 ```bash
-for i in {1..8}; do curl -i http://localhost:8080/api/v1/auth/login; echo ""; done
+# Watch a sentinel promote the replica in real time
+docker compose logs -f sentinel-1 &
+
+# Kill the master
+docker compose stop redis-master
+
+# Within a few seconds, sentinel-1's logs show +sdown / +odown / +failover-triggered
+# / +promoted-slave — redis-replica becomes the new master.
+
+# Traffic continues to be rate-limited correctly throughout, aside from a brief
+# fail-open window while Sentinel detects the failure:
+go run ./cmd/loadtest -url http://localhost:8080/api/v1/resource -concurrency 20
+
+# Bring the old master back - it rejoins as a replica of the new master
+docker compose start redis-master
 ```
 
-Requests 1 through 5 will return `HTTP 200 OK`, while requests 6 through 8 will return `HTTP 429 Too Many Requests`.
+---
 
-### 2. Test Token Bucket Burst Handling
+## Observability
 
-Run 20 rapid requests against the resource route (capacity is 15):
+`/metrics` exposes standard Prometheus metrics on every replica:
+
+- `rate_limiter_requests_total{strategy, status, instance}` — request counts by strategy, `allowed`/`blocked`, and which replica handled it.
+- `rate_limiter_circuit_breaker_state{name, instance}` — `0`=Closed, `1`=Half-Open, `2`=Open, per replica.
+- `rate_limiter_redis_latency_seconds{strategy, instance}` — Redis operation latency histogram.
+
+There's no bundled Prometheus server or Grafana dashboard in this repo. For a project this size, standing up a full monitoring stack that no one queries doesn't add much — the instrumentation itself is the useful, low-cost part. If you want to wire it up: point any Prometheus instance's scrape config at `api-1:8080/metrics`, `api-2:8080/metrics`, `api-3:8080/metrics` (or scrape through nginx, though that won't let you distinguish which instance is being polled).
+
+---
+
+## Testing & CI
 
 ```bash
-for i in {1..20}; do curl -i http://localhost:8080/api/v1/resource; echo ""; done
+go vet ./...
+gofmt -l .                 # should print nothing
+
+# Unit tests (no Redis required)
+go test ./internal/middleware/... ./internal/limiter/... -run 'CircuitBreaker|ExtractIdentifier|RateLimit' -v
+
+# Full suite including Redis-backed integration + concurrency tests
+docker run -d --rm -p 6379:6379 redis:7-alpine
+TEST_REDIS_ADDR=localhost:6379 go test ./... -v -race
 ```
 
-### 3. Test Circuit Breaker Resilience
+`.github/workflows/ci.yml` runs this on every push/PR: `gofmt` check → `go vet` → build → full test suite (`-race`) against a `redis:7-alpine` service container. Test coverage:
 
-Simulate a Redis failure to observe the circuit breaker fail-open behavior:
+| File | Covers |
+|---|---|
+| `circuit_breaker_test.go` | Fail-open behavior, breaker stops calling a dead datastore once tripped |
+| `token_bucket_test.go` | Basic correctness + 100-way concurrent correctness on one identifier |
+| `sliding_window_counter_test.go` | Basic correctness + 50-way concurrent correctness on one identifier |
+| `ratelimit_test.go` | Middleware headers, 429 behavior, fail-open on limiter error, identifier extraction priority |
 
-1. Stop the Redis container:
+---
 
-   ```bash
-   docker compose stop redis
-   ```
+## Verification & Manual Testing
 
-2. Issue multiple requests to trigger circuit failures:
+### Sliding window (single instance behavior)
 
-   ```bash
-   for i in {1..5}; do curl -i http://localhost:8080/api/v1/auth/login; echo ""; done
-   ```
+```bash
+for i in {1..8}; do curl -si http://localhost:8080/api/v1/auth/login | head -n1; done
+```
 
-   Notice that after reaching the failure threshold, the circuit breaker transitions to `OPEN`. Subsequent requests bypass Redis, return `HTTP 200 OK`, and allow traffic to flow without blocking the application.
+Requests 1–5 return `200`, 6–8 return `429`.
 
-3. Restart Redis:
+### Token bucket burst handling
 
-   ```bash
-   docker compose start redis
-   ```
+```bash
+for i in {1..20}; do curl -si http://localhost:8080/api/v1/resource | head -n1; done
+```
+
+### Circuit breaker resilience
+
+```bash
+docker compose stop redis-master redis-replica sentinel-1 sentinel-2 sentinel-3
+for i in {1..8}; do curl -si http://localhost:8080/api/v1/auth/login | head -n1; done
+# All return 200 - each replica's breaker has tripped OPEN and is failing open.
+
+docker compose start redis-master redis-replica sentinel-1 sentinel-2 sentinel-3
+```
+
+### Which instance served a request
+
+```bash
+curl -si http://localhost:8080/api/v1/resource | grep -i x-served-by
+```
+
+Run it a few times — you'll see `api-1`, `api-2`, `api-3` rotate as nginx round-robins.
 
 ---
 
@@ -215,23 +273,35 @@ Simulate a Redis failure to observe the circuit breaker fail-open behavior:
 ```text
 .
 ├── cmd
-│   └── api
-│       └── main.go                   # Application entry point & router setup
-├── Dockerfile                        # Go application build file
-├── docker-compose.yml                # Multi-container service orchestration
-├── go.mod                            # Go module manifest
-├── go.sum                            # Go module checksum lockfile
+│   ├── api
+│   │   └── main.go                   # Entry point, router, Sentinel-aware Redis client
+│   └── loadtest
+│       └── main.go                   # Concurrent load tool proving cross-instance correctness
 ├── internal
 │   ├── config
-│   │   └── config.go                 # Environment & configuration parsing
+│   │   └── config.go                 # Env parsing (instance ID, standalone vs sentinel mode)
 │   ├── limiter
-│   │   ├── circuit_breaker.go        # In-memory circuit breaker state machine
-│   │   ├── limiter.go                # Strategy interface definition
-│   │   ├── sliding_window_counter.go # Sliding window implementation with Redis Lua
-│   │   └── token_bucket.go           # Token bucket implementation with Redis Lua
+│   │   ├── circuit_breaker.go        # Per-instance circuit breaker wrapper
+│   │   ├── circuit_breaker_test.go
+│   │   ├── limiter.go                # Strategy interface
+│   │   ├── sliding_window_counter.go
+│   │   ├── sliding_window_counter_test.go
+│   │   ├── token_bucket.go
+│   │   ├── token_bucket_test.go
+│   │   └── testutil_test.go          # Shared test helpers (Redis connection, unique keys)
 │   ├── metrics
-│   │   └── metrics.go                # Prometheus custom collector definitions
+│   │   └── metrics.go                # Prometheus collectors, instance-labeled
 │   └── middleware
-│       └── ratelimit.go              # HTTP middleware for request interception
-└── prometheus.yml                    # Prometheus scrape target configuration
+│       ├── ratelimit.go              # HTTP middleware
+│       └── ratelimit_test.go
+├── nginx
+│   └── nginx.conf                    # Load balancer config, 3-way upstream
+├── sentinel
+│   └── sentinel.conf                 # Shared Sentinel config (quorum 2)
+├── .github/workflows/ci.yml          # gofmt, vet, build, test (with Redis service container)
+├── .env.example
+├── docker-compose.yml                # 3 API replicas + nginx + Redis Sentinel HA
+├── Dockerfile
+├── go.mod
+└── README.md
 ```

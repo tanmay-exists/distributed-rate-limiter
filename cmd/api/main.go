@@ -12,8 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	_ "rate-limiter/internal/metrics"
-
 	"rate-limiter/internal/config"
 	"rate-limiter/internal/limiter"
 	"rate-limiter/internal/middleware"
@@ -29,27 +27,11 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// 2. Initialize Redis Client with Connection Pool timeouts
-	redisOpts := &redis.Options{
-		Addr:         cfg.RedisAddr,
-		Password:     cfg.RedisPassword,
-		DB:           0,
-		DialTimeout:  2 * time.Second,
-		ReadTimeout:  1 * time.Second,
-		WriteTimeout: 1 * time.Second,
-		PoolSize:     10, // Max active connections
-	}
+	log.Printf("[INFO] Starting instance %q (redis mode: %s)", cfg.InstanceID, cfg.RedisMode)
 
-	// Enable TLS for cloud Redis providers (e.g., Upstash) if requested via ENV
-	if os.Getenv("REDIS_USE_TLS") == "true" {
-		redisOpts.TLSConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
-	}
+	// 2. Initialize Redis client (standalone or Sentinel-managed, see newRedisClient)
+	rdb := newRedisClient(cfg)
 
-	rdb := redis.NewClient(redisOpts)
-
-	// Initial connectivity ping
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer pingCancel()
 
@@ -60,10 +42,10 @@ func main() {
 	}
 
 	// 3. Initialize Limiter Strategies
-	initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	initCtx, initCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer initCancel()
 
-	rawSWCLimiter, err := limiter.NewSlidingWindowCounter(initCtx, rdb, 5, 60) // 5 req / 60s
+	rawSWCLimiter, err := limiter.NewSlidingWindowCounter(initCtx, rdb, cfg.RateLimitRequests, cfg.RateLimitWindowSec)
 	if err != nil {
 		log.Fatalf("Failed to initialize SlidingWindowCounter: %v", err)
 	}
@@ -73,21 +55,23 @@ func main() {
 		log.Fatalf("Failed to initialize TokenBucket: %v", err)
 	}
 
-	// 4. Wrap Strategies in Circuit Breakers
-	swcLimiter := limiter.NewCircuitBreakerLimiter(rawSWCLimiter, "sliding_window_auth")
-	tbLimiter := limiter.NewCircuitBreakerLimiter(rawTBLimiter, "token_bucket_api")
+	// 4. Wrap Strategies in Circuit Breakers (instance-scoped, see circuit_breaker.go)
+	swcLimiter := limiter.NewCircuitBreakerLimiter(rawSWCLimiter, "sliding_window_auth", cfg.InstanceID)
+	tbLimiter := limiter.NewCircuitBreakerLimiter(rawTBLimiter, "token_bucket_api", cfg.InstanceID)
 
 	// 5. Setup Routes
 	mux := http.NewServeMux()
 
 	authHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Served-By", cfg.InstanceID)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"message":"Authentication successful"}`))
 	})
 
 	resourceHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Served-By", cfg.InstanceID)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"message":"Resource retrieved successfully"}`))
 	})
@@ -100,20 +84,22 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"online","service":"Distributed Rate Limiter API"}`))
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"online","service":"Distributed Rate Limiter API","instance":%q}`, cfg.InstanceID)))
 	})
 
-	// Health check endpoint for Load Balancers (AWS ELB / K8s probes)
+	// Health check endpoint for Load Balancers (AWS ELB / K8s probes / nginx)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"OK"}`))
 	})
 
-	// Expose Prometheus Metrics Endpoint
+	// Expose Prometheus metrics. There's no bundled Prometheus/Grafana stack
+	// in this repo (see README) - this is just cheap, standard
+	// instrumentation you can point a scraper at if/when you need it.
 	mux.Handle("/metrics", promhttp.Handler())
 
-	mux.Handle("/api/v1/auth/login", middleware.RateLimit(swcLimiter)(authHandler))
-	mux.Handle("/api/v1/resource", middleware.RateLimit(tbLimiter)(resourceHandler))
+	mux.Handle("/api/v1/auth/login", middleware.RateLimit(swcLimiter, cfg.InstanceID)(authHandler))
+	mux.Handle("/api/v1/resource", middleware.RateLimit(tbLimiter, cfg.InstanceID)(resourceHandler))
 
 	// 6. Configure HTTP Server
 	server := &http.Server{
@@ -165,4 +151,45 @@ func main() {
 
 		log.Println("[INFO] Server exited gracefully.")
 	}
+}
+
+// newRedisClient builds either a standalone client or a Sentinel-aware
+// failover client depending on cfg.RedisMode.
+//
+// In "sentinel" mode, go-redis queries the Sentinel quorum for the current
+// master address before connecting, and transparently re-resolves it if a
+// failover happens - removing Redis from being a single point of failure.
+// In "standalone" mode (the default; used for local dev and CI) it connects
+// directly to a single Redis instance.
+func newRedisClient(cfg *config.Config) *redis.Client {
+	var tlsConfig *tls.Config
+	if os.Getenv("REDIS_USE_TLS") == "true" {
+		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+
+	if cfg.RedisMode == "sentinel" {
+		log.Printf("[INFO] Connecting to Redis via Sentinel (master=%s, sentinels=%v)", cfg.RedisMasterName, cfg.RedisSentinelAddrs)
+		return redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    cfg.RedisMasterName,
+			SentinelAddrs: cfg.RedisSentinelAddrs,
+			Password:      cfg.RedisPassword,
+			DialTimeout:   2 * time.Second,
+			ReadTimeout:   1 * time.Second,
+			WriteTimeout:  1 * time.Second,
+			PoolSize:      10,
+			TLSConfig:     tlsConfig,
+		})
+	}
+
+	log.Printf("[INFO] Connecting to standalone Redis at %s", cfg.RedisAddr)
+	return redis.NewClient(&redis.Options{
+		Addr:         cfg.RedisAddr,
+		Password:     cfg.RedisPassword,
+		DB:           0,
+		DialTimeout:  2 * time.Second,
+		ReadTimeout:  1 * time.Second,
+		WriteTimeout: 1 * time.Second,
+		PoolSize:     10,
+		TLSConfig:    tlsConfig,
+	})
 }

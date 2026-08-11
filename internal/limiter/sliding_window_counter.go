@@ -47,9 +47,8 @@ type SlidingWindowCounter struct {
 }
 
 func NewSlidingWindowCounter(ctx context.Context, client *redis.Client, maxReqs, windowSec int64) (*SlidingWindowCounter, error) {
-	err := client.FunctionLoadReplace(ctx, slidingWindowCounterLib).Err()
-	if err != nil && err.Error() != "ERR Library 'sw_counter_lib' already exists" {
-		fmt.Printf("Notice on sw_counter_lib load: %v\n", err)
+	if err := loadFunctionWithRetry(ctx, client, slidingWindowCounterLib, "sw_counter_lib"); err != nil {
+		return nil, err
 	}
 
 	return &SlidingWindowCounter{

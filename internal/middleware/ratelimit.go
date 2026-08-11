@@ -12,7 +12,11 @@ import (
 	"rate-limiter/internal/metrics"
 )
 
-func RateLimit(l limiter.Limiter) func(http.Handler) http.Handler {
+// RateLimit builds a middleware around Limiter l. instanceID identifies the
+// replica this middleware is running in and is attached to every metric it
+// emits, so behavior can be compared across replicas in a multi-instance
+// deployment.
+func RateLimit(l limiter.Limiter, instanceID string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			identifier := extractIdentifier(r)
@@ -22,13 +26,12 @@ func RateLimit(l limiter.Limiter) func(http.Handler) http.Handler {
 			result, err := l.Allow(r.Context(), identifier)
 			duration := time.Since(start).Seconds()
 
-			// Record latency metric with strategy name label
-			metrics.RedisLatency.WithLabelValues(l.Name()).Observe(duration)
+			metrics.RedisLatency.WithLabelValues(l.Name(), instanceID).Observe(duration)
 
 			if err != nil {
 				// Fail-Open Pattern: Log fault and let traffic pass during outages
 				log.Printf("Rate limiter error for client %s: %v", identifier, err)
-				metrics.RequestsTotal.WithLabelValues(l.Name(), "allowed").Inc()
+				metrics.RequestsTotal.WithLabelValues(l.Name(), "allowed", instanceID).Inc()
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -37,8 +40,8 @@ func RateLimit(l limiter.Limiter) func(http.Handler) http.Handler {
 
 			// 2. Handle Rate Limited Traffic
 			if !result.Allowed {
-				metrics.RequestsTotal.WithLabelValues(l.Name(), "blocked").Inc()
-				
+				metrics.RequestsTotal.WithLabelValues(l.Name(), "blocked", instanceID).Inc()
+
 				w.Header().Set("Retry-After", strconv.FormatInt(result.ResetSec, 10))
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusTooManyRequests)
@@ -47,7 +50,7 @@ func RateLimit(l limiter.Limiter) func(http.Handler) http.Handler {
 			}
 
 			// 3. Handle Allowed Traffic
-			metrics.RequestsTotal.WithLabelValues(l.Name(), "allowed").Inc()
+			metrics.RequestsTotal.WithLabelValues(l.Name(), "allowed", instanceID).Inc()
 			next.ServeHTTP(w, r)
 		})
 	}
