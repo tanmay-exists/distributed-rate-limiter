@@ -265,7 +265,6 @@ curl -si http://localhost:8080/api/v1/resource | grep -i x-served-by
 
 Run it a few times — you'll see `api-1`, `api-2`, `api-3` rotate as nginx round-robins.
 
----
 
 ---
 
@@ -336,6 +335,8 @@ Fired 30 concurrent requests in 1.16s
 
 17 rather than exactly 15 here is expected, not a bug: the token bucket refills on whole-second boundaries (`time.Now().Unix()`), so a burst spanning a one-second rollover picks up a couple of extra refilled tokens mid-run — the same effect covered in [Rate Limiting Algorithms](#rate-limiting-algorithms).
 
+
+---
 
 ## Directory Structure
 
