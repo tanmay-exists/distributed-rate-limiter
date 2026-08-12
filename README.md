@@ -1,4 +1,5 @@
-# Distributed Rate Limiter
+# Distributed Rate Limiter 
+**Live Demo:** [distributed-rate-limiter-35lf.onrender.com](https://distributed-rate-limiter-35lf.onrender.com)
 
 A distributed rate limiting service built in Go. Multiple stateless API replicas sit behind an nginx load balancer and share rate-limit state through Redis 7+ Lua functions (`FCALL`), so the limit is enforced globally, not per-process. Redis itself runs as a Sentinel-managed master/replica pair for automatic failover. Each replica wraps its Redis calls in an in-memory circuit breaker for fail-open resilience during datastore outages.
 
@@ -265,6 +266,76 @@ curl -si http://localhost:8080/api/v1/resource | grep -i x-served-by
 Run it a few times — you'll see `api-1`, `api-2`, `api-3` rotate as nginx round-robins.
 
 ---
+
+---
+
+## Live Deployment Verification
+
+The service is also deployed on Render at `https://distributed-rate-limiter-35lf.onrender.com` as a single instance (Render's free tier runs one replica, not the 3-node setup used locally — this section verifies the live deployment works correctly, not the multi-instance distribution claim; see [Concurrency Correctness](#concurrency-correctness) for that).
+
+### Health check
+
+```bash
+curl -i https://distributed-rate-limiter-35lf.onrender.com/health
+```
+
+```text
+HTTP/2 200
+{"status":"OK"}
+```
+
+### Sliding window (auth route)
+
+```bash
+for i in {1..8}; do
+  curl -s -w "Request $i: HTTP %{http_code}\n" https://distributed-rate-limiter-35lf.onrender.com/api/v1/auth/login
+done
+```
+
+Requests 1–5 return `200`, 6–8 return `429` — matches the 5 req/60s limit.
+
+### Token bucket under concurrency
+
+```bash
+for i in {1..25}; do
+  curl -s -w "%{http_code}\n" https://distributed-rate-limiter-35lf.onrender.com/api/v1/resource &
+done; wait
+```
+
+25 requests fired concurrently against the live deployment; confirmed via `/metrics` immediately after:
+
+```bash
+curl -s https://distributed-rate-limiter-35lf.onrender.com/metrics | grep rate_limiter_requests_total
+```
+
+```text
+rate_limiter_requests_total{instance="render-api-1",status="allowed",strategy="token_bucket_api"} 15
+rate_limiter_requests_total{instance="render-api-1",status="blocked",strategy="token_bucket_api"} 10
+```
+
+Exactly 15 allowed (the token bucket's capacity), 10 blocked — correct under real concurrent load over the network, not just localhost.
+
+### Load test tool against the live URL
+
+`cmd/loadtest` works against any URL, not just the local stack:
+
+```bash
+go run ./cmd/loadtest -url https://distributed-rate-limiter-35lf.onrender.com/api/v1/resource -concurrency 30 -key live-test
+```
+
+```text
+Fired 30 concurrent requests in 1.16s
+
+  allowed (200):        17
+  blocked (429):        13
+  failed (network/etc): 0
+
+  requests served per backend instance:
+    render-api-1      17
+```
+
+17 rather than exactly 15 here is expected, not a bug: the token bucket refills on whole-second boundaries (`time.Now().Unix()`), so a burst spanning a one-second rollover picks up a couple of extra refilled tokens mid-run — the same effect covered in [Rate Limiting Algorithms](#rate-limiting-algorithms).
+
 
 ## Directory Structure
 
